@@ -87,34 +87,72 @@ async def _login(page):
         log(f"Page snippet (2000-3500): {content[2000:3500]}")
         raise RuntimeError(f"Could not find email input on login page (url={page.url})")
 
+    # Fill email
+    await page.fill(email_sel, EMAIL)
+    log(f"Filled email: {EMAIL}")
+    await asyncio.sleep(1)
+
+    # Check if password field is already visible (single-step) or need to click Next first
+    pass_visible = await page.query_selector('input[type="password"]')
+
+    if not pass_visible:
+        # Two-step flow: click Next/Continue to reveal password field
+        log("Password not visible yet — looking for Next button...")
+        next_selectors = [
+            'button:has-text("Next")',
+            'button:has-text("Continue")',
+            'input[value="Next"]',
+            'input[value="Continue"]',
+            'button[type="submit"]',
+            'input[type="submit"]',
+        ]
+        for sel in next_selectors:
+            btn = await page.query_selector(sel)
+            if btn:
+                log(f"Clicking Next: {sel}")
+                await btn.click()
+                await asyncio.sleep(3)
+                break
+
+    # Now wait for password field
+    PASSWORD_SELECTORS = [
+        "#loginradius-login-password",
+        'input[id*="password" i]',
+        'input[name*="password" i]',
+        'input[type="password"]',
+    ]
     pass_sel = None
     for sel in PASSWORD_SELECTORS:
         try:
-            el = await page.query_selector(sel)
-            if el:
-                pass_sel = sel
-                break
-        except Exception:
+            await page.wait_for_selector(sel, timeout=8_000)
+            pass_sel = sel
+            log(f"Found password field: {sel}")
+            break
+        except PWTimeout:
             continue
 
-    await page.fill(email_sel, EMAIL)
-    if pass_sel:
+    if not pass_sel:
+        log("WARNING: Could not find password field — attempting submit anyway")
+    else:
         await page.fill(pass_sel, PASSWORD)
+        log("Filled password")
+        await asyncio.sleep(1)
 
-    # Click submit
+    # Click the final submit / Sign In button
     submit_selectors = [
         'button[class*="loginradius-submit"]',
         'input[class*="loginradius-submit"]',
-        'button[type="submit"]',
-        'input[type="submit"]',
         'button:has-text("Sign In")',
         'button:has-text("Log In")',
         'button:has-text("Login")',
+        'button[type="submit"]',
+        'input[type="submit"]',
     ]
     for sel in submit_selectors:
         try:
             btn = await page.query_selector(sel)
             if btn:
+                log(f"Clicking submit: {sel}")
                 await btn.click()
                 break
         except Exception:
