@@ -83,9 +83,10 @@ async def _login(page):
     log(f"Credentials set for {EMAIL}")
     await asyncio.sleep(1)
 
-    # Click the Sign In button
+    # Click the Sign In button via JS (element may not be "visible" to Playwright
+    # even though it works fine — bypass actionability checks with evaluate)
     log("Clicking Sign In...")
-    await page.click('#loginradius-submit-login')
+    await page.evaluate("document.querySelector('#loginradius-submit-login').click()")
 
     # After submitting credentials, wait for redirect back to perfectmind.com
     # (accounts.surrey.ca never reaches networkidle — it has ongoing analytics calls)
