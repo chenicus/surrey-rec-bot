@@ -102,16 +102,27 @@ async def _login(page):
     log("Logged in ✓")
 
 
-async def _find_and_click(page, class_name: str, location: str) -> bool:
-    # The booking page uses div.bm-class-container for each class card
+CONTACT_ID = os.getenv("SURREY_CONTACT_ID", "283f188a-f820-428b-a38d-9d5b325291f8")
+
+
+async def _do_registration(page, class_name: str, location: str) -> bool:
+    """
+    Full 3-step registration flow (verified by watching the real site):
+      1. Booking page  → find class card → click input.bm-class-details
+      2. Detail page   → click a.bm-book-button
+      3. Attendee page → check David Chen's checkbox → click Next
+    """
+
+    # ── Step 1: find the class card and click Register ──────────────────────
     try:
         await page.wait_for_selector(".bm-class-container", timeout=8_000)
     except PWTimeout:
-        log("No rows visible yet.")
+        log("No class cards visible yet.")
 
     rows = await page.query_selector_all(".bm-class-container")
-    log(f"Scanning {len(rows)} rows for '{class_name}' @ '{location}'...")
+    log(f"Scanning {len(rows)} cards for '{class_name}' @ '{location}'...")
 
+    clicked_card = False
     for row in rows:
         try:
             text = (await row.inner_text()).strip()
@@ -122,33 +133,122 @@ async def _find_and_click(page, class_name: str, location: str) -> bool:
         if location.lower() not in text.lower():
             continue
 
-        log(f"Matched: {text[:120]!r}")
-        # Register button is input.bm-class-details — click via JS (may not be "visible")
-        btn = await row.query_selector("input.bm-class-details, input.bm-details-button")
-        if btn:
-            log("Clicking Register...")
-            await page.evaluate("el => el.click()", btn)
-            await asyncio.sleep(4)
-            return True
-        else:
-            log("Row matched but no Register button (full or already registered).")
+        log(f"Matched card: {text[:100]!r}")
+        btn = await row.query_selector("input.bm-class-details")
+        if not btn:
+            log("Card matched but no Register button (full?).")
+            continue
+        log("Step 1: clicking card Register button...")
+        await page.evaluate("el => el.click()", btn)
+        clicked_card = True
+        break
 
-    return False
+    if not clicked_card:
+        return False
 
+    # ── Step 2: detail page — click the Register link ───────────────────────
+    try:
+        await page.wait_for_selector("a.bm-book-button", timeout=10_000)
+    except PWTimeout:
+        log("Detail page Register button not found.")
+        return False
 
-async def _confirm(page) -> bool:
-    content = (await page.content()).lower()
-    if any(w in content for w in ("success", "you are registered", "booking confirmed", "thank you")):
-        log("Confirmed ✓")
+    log(f"Step 2: on detail page ({page.url[:60]}...)")
+    # Check "Already Registered" or "Already Booked" here (success for a re-run)
+    detail_text = (await page.content()).lower()
+    if "already registered" in detail_text or "already booked" in detail_text:
+        log("Already registered ✓")
         return True
-    btn = await page.query_selector(
-        "button:has-text('Confirm'), button:has-text('Submit'), "
-        "button:has-text('Complete'), input[value='Confirm'], input[value='Submit']"
-    )
-    if btn:
-        await btn.click()
-        await page.wait_for_load_state("networkidle", timeout=10_000)
+
+    await page.evaluate("document.querySelector('a.bm-book-button').click()")
+    await asyncio.sleep(3)
+
+    # ── Step 3: Select Attendee page — check David Chen, click Next ──────────
+    try:
+        await page.wait_for_selector("input.member-id", timeout=10_000)
+    except PWTimeout:
+        log("Select Attendee page did not appear.")
+        return False
+
+    log(f"Step 3: on attendee page ({page.url[:60]}...)")
+
+    result = await page.evaluate(f"""
+        () => {{
+            // Find David Chen by ContactId (MemberId field)
+            const memberInputs = [...document.querySelectorAll('input.member-id')];
+            const memberInput = memberInputs.find(el => el.value === '{CONTACT_ID}');
+            if (!memberInput) return 'contact_not_found';
+
+            // Derive the IsParticipating checkbox name from the MemberId field name
+            const checkboxName = memberInput.name.replace('.MemberId', '.IsParticipating');
+            const checkbox = document.querySelector(`input[name="${{checkboxName}}"][type="checkbox"]`);
+            if (!checkbox) return 'checkbox_not_found';
+
+            // Check attendance status — if already booked, count as success
+            const statusName = memberInput.name.replace('.MemberId', '.AttendanceStatus');
+            const statusInput = document.querySelector(`input[name="${{statusName}}"]`);
+            if (statusInput && statusInput.value === 'Booked') return 'already_booked';
+
+            if (checkbox.disabled) return 'checkbox_disabled';
+
+            checkbox.click();
+            return 'checked';
+        }}
+    """)
+    log(f"Attendee selection result: {result}")
+
+    if result in ("already_booked",):
+        log("David Chen already registered ✓")
         return True
+    if result not in ("checked",):
+        log(f"Could not select David Chen: {result}")
+        return False
+
+    # Click the Next button (becomes enabled after checking the checkbox)
+    await asyncio.sleep(1)
+    next_clicked = await page.evaluate("""
+        () => {
+            const btn = document.querySelector('a.bm-button:not(.disabled)');
+            if (btn) { btn.click(); return true; }
+            return false;
+        }
+    """)
+    if not next_clicked:
+        log("Next button not enabled after selecting attendee.")
+        return False
+
+    log("Clicked Next — waiting for confirmation...")
+    await asyncio.sleep(4)
+
+    # ── Step 4: confirmation / checkout ─────────────────────────────────────
+    final_text = (await page.content()).lower()
+    log(f"Final page URL: {page.url[:80]}")
+    if any(w in final_text for w in ("success", "confirmed", "thank you", "booked", "registered", "receipt", "checkout")):
+        log("Registration confirmed ✓")
+        return True
+
+    # If there's a final Confirm/Submit button (e.g. zero-cost checkout), click it
+    confirm = await page.evaluate("""
+        () => {
+            const sel = [
+                'input[value="Confirm"]', 'input[value="Submit"]',
+                'button:not(.disabled)', 'a.bm-button:not(.disabled)'
+            ];
+            for (const s of sel) {
+                const el = document.querySelector(s);
+                if (el && /confirm|submit|complete|next|pay/i.test(el.textContent + el.value)) {
+                    el.click(); return el.textContent || el.value;
+                }
+            }
+            return null;
+        }
+    """)
+    if confirm:
+        log(f"Clicked final button: {confirm!r}")
+        await asyncio.sleep(3)
+        return True
+
+    log("Could not confirm registration — unknown final page state.")
     return False
 
 
@@ -197,17 +297,17 @@ async def register(class_name: str, location: str) -> bool:
             await page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=30_000)
             await asyncio.sleep(3)
 
-            for attempt in range(1, 6):
-                log(f"Attempt {attempt}/5")
-                found = await _find_and_click(page, class_name, location)
-                if found:
-                    success = await _confirm(page)
-                    if success:
-                        log(f"✅ Registered: {class_name} @ {location}")
-                        break
-                if attempt < 5:
-                    await asyncio.sleep(4)
-                    await page.reload(wait_until="domcontentloaded", timeout=10_000)
+            for attempt in range(1, 4):
+                log(f"Attempt {attempt}/3")
+                success = await _do_registration(page, class_name, location)
+                if success:
+                    log(f"✅ Registered: {class_name} @ {location}")
+                    break
+                if attempt < 3:
+                    log("Retrying — reloading booking page...")
+                    await asyncio.sleep(3)
+                    await page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=30_000)
+                    await asyncio.sleep(3)
 
             if not success:
                 log(f"❌ Could not register: {class_name} @ {location}")
