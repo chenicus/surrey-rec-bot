@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: surrey-rec-bot
+    runtime: docker
+    plan: free
+    envVars:
+      - key: SURREY_EMAIL
+        sync: false
+      - key: SURREY_PASSWORD
+        sync: false
+      - key: SURREY_CONTACT_ID
+        value: 283f188a-f820-428b-a38d-9d5b325291f8
+      - key: PORT
+        value: 8080
