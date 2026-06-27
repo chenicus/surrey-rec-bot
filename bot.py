@@ -29,11 +29,83 @@ def log(msg: str):
 
 async def _login(page):
     log("Logging in...")
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=20_000)
-    await page.fill('input[id*="Email"], input[name*="Email"], input[type="email"]', EMAIL)
-    await page.fill('input[id*="Password"], input[name*="Password"], input[type="password"]', PASSWORD)
-    await page.click('button[type="submit"], input[type="submit"], button:has-text("Sign In"), button:has-text("Log In")')
-    await page.wait_for_load_state("networkidle", timeout=20_000)
+    await page.goto(LOGIN_URL, wait_until="networkidle", timeout=30_000)
+    log(f"Login page loaded: {page.url}")
+
+    # Surrey uses LoginRadius widget — wait for it to render (JS-injected)
+    EMAIL_SELECTORS = [
+        # LoginRadius-specific
+        "#loginradius-login-emailid",
+        ".loginradius-user-emailid",
+        'input[id*="loginradius"][id*="email" i]',
+        'input[class*="loginradius"][id*="email" i]',
+        # Generic fallbacks
+        'input[id*="Email" i]',
+        'input[name*="Email" i]',
+        'input[type="email"]',
+    ]
+    PASSWORD_SELECTORS = [
+        "#loginradius-login-password",
+        ".loginradius-user-password",
+        'input[id*="loginradius"][id*="password" i]',
+        'input[id*="Password" i]',
+        'input[name*="Password" i]',
+        'input[type="password"]',
+    ]
+
+    # Wait up to 15s for any email field to appear (LoginRadius loads async)
+    email_sel = None
+    for sel in EMAIL_SELECTORS:
+        try:
+            await page.wait_for_selector(sel, timeout=15_000)
+            email_sel = sel
+            log(f"Found email field: {sel}")
+            break
+        except PWTimeout:
+            continue
+
+    if not email_sel:
+        # Last resort: dump what's on the page to help debug
+        content = await page.content()
+        log(f"Page snippet: {content[2000:3000]}")
+        raise RuntimeError("Could not find email input on login page")
+
+    pass_sel = None
+    for sel in PASSWORD_SELECTORS:
+        try:
+            el = await page.query_selector(sel)
+            if el:
+                pass_sel = sel
+                break
+        except Exception:
+            continue
+
+    await page.fill(email_sel, EMAIL)
+    if pass_sel:
+        await page.fill(pass_sel, PASSWORD)
+
+    # Click submit
+    submit_selectors = [
+        'button[class*="loginradius-submit"]',
+        'input[class*="loginradius-submit"]',
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button:has-text("Sign In")',
+        'button:has-text("Log In")',
+        'button:has-text("Login")',
+    ]
+    for sel in submit_selectors:
+        try:
+            btn = await page.query_selector(sel)
+            if btn:
+                await btn.click()
+                break
+        except Exception:
+            continue
+
+    await page.wait_for_load_state("networkidle", timeout=30_000)
+    log(f"After login URL: {page.url}")
+
     if "login" in page.url.lower() or "signin" in page.url.lower():
         raise RuntimeError("Login failed — check SURREY_EMAIL / SURREY_PASSWORD")
     log("Logged in ✓")
