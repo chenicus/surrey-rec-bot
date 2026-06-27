@@ -48,115 +48,44 @@ async def _login(page):
     await asyncio.sleep(4)
     log(f"After login click: {page.url}")
 
-    # Surrey uses LoginRadius widget — wait for it to render (JS-injected)
-    EMAIL_SELECTORS = [
-        # LoginRadius-specific
-        "#loginradius-login-emailid",
-        ".loginradius-user-emailid",
-        'input[id*="loginradius"][id*="email" i]',
-        'input[class*="loginradius"][id*="email" i]',
-        # Generic fallbacks
-        'input[id*="Email" i]',
-        'input[name*="Email" i]',
-        'input[type="email"]',
-    ]
-    PASSWORD_SELECTORS = [
-        "#loginradius-login-password",
-        ".loginradius-user-password",
-        'input[id*="loginradius"][id*="password" i]',
-        'input[id*="Password" i]',
-        'input[name*="Password" i]',
-        'input[type="password"]',
-    ]
-
-    # Wait up to 15s for any email field to appear (LoginRadius loads async)
-    email_sel = None
-    for sel in EMAIL_SELECTORS:
-        try:
-            await page.wait_for_selector(sel, timeout=15_000)
-            email_sel = sel
-            log(f"Found email field: {sel}")
-            break
-        except PWTimeout:
-            continue
-
-    if not email_sel:
-        # Dump page content and URL to help debug
+    # Wait for LoginRadius form to render (JS-injected, confirmed ID: #loginradius-login-emailid)
+    try:
+        await page.wait_for_selector("#loginradius-login-emailid", timeout=15_000)
+        log("LoginRadius form ready")
+    except PWTimeout:
         content = await page.content()
         log(f"Current URL: {page.url}")
-        log(f"Page snippet (2000-3500): {content[2000:3500]}")
-        raise RuntimeError(f"Could not find email input on login page (url={page.url})")
+        log(f"Page snippet: {content[1000:2500]}")
+        raise RuntimeError(f"LoginRadius form did not appear (url={page.url})")
 
-    # Fill email
-    await page.fill(email_sel, EMAIL)
-    log(f"Filled email: {EMAIL}")
+    # Use the native value setter — this is what LoginRadius actually requires.
+    # Playwright's fill()/type() don't always trigger LoginRadius's React event handlers,
+    # but setting value via the native HTMLInputElement prototype setter + dispatching
+    # input/change events works reliably (verified manually).
+    log("Filling credentials via native value setter...")
+    await page.evaluate(
+        """([email, password]) => {
+            function setVal(sel, value) {
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                setter.call(el, value);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            }
+            setVal('#loginradius-login-emailid', email);
+            setVal('#loginradius-login-password', password);
+        }""",
+        [EMAIL, PASSWORD],
+    )
+    log(f"Credentials set for {EMAIL}")
     await asyncio.sleep(1)
 
-    # Check if password field is already visible (single-step) or need to click Next first
-    pass_visible = await page.query_selector('input[type="password"]')
-
-    if not pass_visible:
-        # Two-step flow: click Next/Continue to reveal password field
-        log("Password not visible yet — looking for Next button...")
-        next_selectors = [
-            'button:has-text("Next")',
-            'button:has-text("Continue")',
-            'input[value="Next"]',
-            'input[value="Continue"]',
-            'button[type="submit"]',
-            'input[type="submit"]',
-        ]
-        for sel in next_selectors:
-            btn = await page.query_selector(sel)
-            if btn:
-                log(f"Clicking Next: {sel}")
-                await btn.click()
-                await asyncio.sleep(3)
-                break
-
-    # Now wait for password field
-    PASSWORD_SELECTORS = [
-        "#loginradius-login-password",
-        'input[id*="password" i]',
-        'input[name*="password" i]',
-        'input[type="password"]',
-    ]
-    pass_sel = None
-    for sel in PASSWORD_SELECTORS:
-        try:
-            await page.wait_for_selector(sel, timeout=8_000)
-            pass_sel = sel
-            log(f"Found password field: {sel}")
-            break
-        except PWTimeout:
-            continue
-
-    if not pass_sel:
-        log("WARNING: Could not find password field — attempting submit anyway")
-    else:
-        await page.fill(pass_sel, PASSWORD)
-        log("Filled password")
-        await asyncio.sleep(1)
-
-    # Click the final submit / Sign In button
-    submit_selectors = [
-        'button[class*="loginradius-submit"]',
-        'input[class*="loginradius-submit"]',
-        'button:has-text("Sign In")',
-        'button:has-text("Log In")',
-        'button:has-text("Login")',
-        'button[type="submit"]',
-        'input[type="submit"]',
-    ]
-    for sel in submit_selectors:
-        try:
-            btn = await page.query_selector(sel)
-            if btn:
-                log(f"Clicking submit: {sel}")
-                await btn.click()
-                break
-        except Exception:
-            continue
+    # Click the Sign In button
+    log("Clicking Sign In...")
+    await page.click('#loginradius-submit-login')
 
     # After submitting credentials, wait for redirect back to perfectmind.com
     # (accounts.surrey.ca never reaches networkidle — it has ongoing analytics calls)
