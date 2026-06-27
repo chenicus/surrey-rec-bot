@@ -120,11 +120,17 @@ async def _login(page):
         except Exception:
             continue
 
-    await page.wait_for_load_state("networkidle", timeout=30_000)
+    # After submitting credentials, wait for redirect back to perfectmind.com
+    # (accounts.surrey.ca never reaches networkidle — it has ongoing analytics calls)
+    try:
+        await page.wait_for_url("*perfectmind.com*", timeout=30_000)
+    except PWTimeout:
+        pass
+    await asyncio.sleep(2)
     log(f"After login URL: {page.url}")
 
-    if "login" in page.url.lower() or "signin" in page.url.lower():
-        raise RuntimeError("Login failed — check SURREY_EMAIL / SURREY_PASSWORD")
+    if "accounts.surrey.ca" in page.url or "auth.aspx" in page.url.lower():
+        raise RuntimeError("Login failed — still on auth page. Check SURREY_EMAIL / SURREY_PASSWORD")
     log("Logged in ✓")
 
 
