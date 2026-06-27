@@ -19,8 +19,8 @@ from bot import register   # uses Playwright (login requires JS execution)
 PACIFIC = pytz.timezone("America/Vancouver")
 PORT    = int(os.getenv("PORT", 8080))
 
-BAD = "Drop In Badminton - Senior Services"
-TT  = "Drop In Table Tennis - Senior Services"
+BAD = "Drop In Badminton - Seniors Services"
+TT  = "Drop In Table Tennis - Seniors Services"
 GF  = "Guildford"
 NW  = "Newton"
 

@@ -103,18 +103,13 @@ async def _login(page):
 
 
 async def _find_and_click(page, class_name: str, location: str) -> bool:
+    # The booking page uses div.bm-class-container for each class card
     try:
-        await page.wait_for_selector(
-            ".booking-item, .class-row, [class*='ClassCard'], [class*='class-item'], [class*='card']",
-            timeout=8_000,
-        )
+        await page.wait_for_selector(".bm-class-container", timeout=8_000)
     except PWTimeout:
         log("No rows visible yet.")
 
-    rows = await page.query_selector_all(
-        ".booking-item, .class-row, [class*='ClassCard'], [class*='class-item'], "
-        "[class*='card'], li[class*='event'], tr[class*='row'], div[class*='card']"
-    )
+    rows = await page.query_selector_all(".bm-class-container")
     log(f"Scanning {len(rows)} rows for '{class_name}' @ '{location}'...")
 
     for row in rows:
@@ -127,27 +122,16 @@ async def _find_and_click(page, class_name: str, location: str) -> bool:
         if location.lower() not in text.lower():
             continue
 
-        log(f"Matched: {text[:100]!r}")
-        btn = await row.query_selector(
-            "button, a[href*='book'], a[href*='register'], "
-            "a[class*='register'], a[class*='book'], button[class*='register']"
-        )
-        if not btn:
-            try:
-                parent = await row.evaluate_handle(
-                    "el => el.closest('tr, li, .card, .item') || el.parentElement"
-                )
-                btn = await parent.query_selector("button, a[href*='book'], a[href*='register']")
-            except Exception:
-                pass
-
+        log(f"Matched: {text[:120]!r}")
+        # Register button is input.bm-class-details — click via JS (may not be "visible")
+        btn = await row.query_selector("input.bm-class-details, input.bm-details-button")
         if btn:
-            log(f"Clicking: {(await btn.inner_text()).strip()!r}")
-            await btn.click()
-            await page.wait_for_load_state("networkidle", timeout=10_000)
+            log("Clicking Register...")
+            await page.evaluate("el => el.click()", btn)
+            await asyncio.sleep(4)
             return True
         else:
-            log("Row matched but no button (full or already registered).")
+            log("Row matched but no Register button (full or already registered).")
 
     return False
 
