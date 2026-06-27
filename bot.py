@@ -30,7 +30,9 @@ def log(msg: str):
 async def _login(page):
     log("Logging in...")
     # Navigate to the booking page first
-    await page.goto(BOOKING_URL, wait_until="networkidle", timeout=30_000)
+    await page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=30_000)
+    # Give JS widgets a moment to render (LoginRadius injects dynamically)
+    await asyncio.sleep(3)
     log(f"Landed on: {page.url}")
 
     # Check if already logged in (no Login button visible)
@@ -42,7 +44,8 @@ async def _login(page):
     # Click the Login button to open the login form/modal
     log("Clicking Login button...")
     await login_btn.click()
-    await page.wait_for_load_state("networkidle", timeout=15_000)
+    # Wait for LoginRadius form to inject (it's JS-rendered)
+    await asyncio.sleep(4)
     log(f"After login click: {page.url}")
 
     # Surrey uses LoginRadius widget — wait for it to render (JS-injected)
@@ -214,8 +217,9 @@ async def register(class_name: str, location: str) -> bool:
         success = False
         try:
             await _login(page)
-            await page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=15_000)
-            await page.reload(wait_until="domcontentloaded", timeout=10_000)
+            # After login, reload the booking page fresh (login may have redirected us)
+            await page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=30_000)
+            await asyncio.sleep(3)
 
             for attempt in range(1, 6):
                 log(f"Attempt {attempt}/5")
