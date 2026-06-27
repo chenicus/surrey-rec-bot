@@ -167,9 +167,13 @@ async def _confirm(page) -> bool:
     return False
 
 
+SESSION_FILE = "/tmp/surrey_session.json"
+
+
 async def register(class_name: str, location: str) -> bool:
     """
     Main entry point. Returns True if registration succeeded.
+    Reuses a saved browser session so login only happens once per process lifetime.
     """
     if not EMAIL or not PASSWORD:
         raise RuntimeError("SURREY_EMAIL and SURREY_PASSWORD environment variables are not set.")
@@ -184,13 +188,27 @@ async def register(class_name: str, location: str) -> bool:
                 "--single-process",
             ],
         )
-        ctx  = await browser.new_context(viewport={"width": 1280, "height": 900})
+
+        # Load saved session if it exists (avoids re-login on every run)
+        import os as _os
+        storage = SESSION_FILE if _os.path.exists(SESSION_FILE) else None
+        if storage:
+            log(f"Loading saved session from {SESSION_FILE}")
+        ctx  = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            storage_state=storage,
+        )
         page = await ctx.new_page()
 
         success = False
         try:
             await _login(page)
-            # After login, reload the booking page fresh (login may have redirected us)
+
+            # Save session after successful login so next run skips login
+            await ctx.storage_state(path=SESSION_FILE)
+            log("Session saved ✓")
+
+            # Load the booking page
             await page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=30_000)
             await asyncio.sleep(3)
 
@@ -211,6 +229,11 @@ async def register(class_name: str, location: str) -> bool:
 
         except Exception as e:
             log(f"ERROR: {e}")
+            # If login failed, delete stale session so next run tries fresh
+            if "Login failed" in str(e) or "LoginRadius form" in str(e):
+                if _os.path.exists(SESSION_FILE):
+                    _os.remove(SESSION_FILE)
+                    log("Deleted stale session file")
             raise
         finally:
             await browser.close()
