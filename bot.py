@@ -29,8 +29,21 @@ def log(msg: str):
 
 async def _login(page):
     log("Logging in...")
-    await page.goto(LOGIN_URL, wait_until="networkidle", timeout=30_000)
-    log(f"Login page loaded: {page.url}")
+    # Navigate to the booking page first
+    await page.goto(BOOKING_URL, wait_until="networkidle", timeout=30_000)
+    log(f"Landed on: {page.url}")
+
+    # Check if already logged in (no Login button visible)
+    login_btn = await page.query_selector('a:has-text("Login"), button:has-text("Login"), a:has-text("Log In"), button:has-text("Log In"), a:has-text("Sign In")')
+    if not login_btn:
+        log("Already logged in ✓")
+        return
+
+    # Click the Login button to open the login form/modal
+    log("Clicking Login button...")
+    await login_btn.click()
+    await page.wait_for_load_state("networkidle", timeout=15_000)
+    log(f"After login click: {page.url}")
 
     # Surrey uses LoginRadius widget — wait for it to render (JS-injected)
     EMAIL_SELECTORS = [
@@ -65,10 +78,11 @@ async def _login(page):
             continue
 
     if not email_sel:
-        # Last resort: dump what's on the page to help debug
+        # Dump page content and URL to help debug
         content = await page.content()
-        log(f"Page snippet: {content[2000:3000]}")
-        raise RuntimeError("Could not find email input on login page")
+        log(f"Current URL: {page.url}")
+        log(f"Page snippet (2000-3500): {content[2000:3500]}")
+        raise RuntimeError(f"Could not find email input on login page (url={page.url})")
 
     pass_sel = None
     for sel in PASSWORD_SELECTORS:
