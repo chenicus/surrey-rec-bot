@@ -12,7 +12,7 @@ from datetime import datetime
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 from bot import register   # uses Playwright (login requires JS execution)
 
@@ -158,6 +158,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div id="log-list"></div>
 </div>
 
+<div style="margin-top:1.5rem;padding:14px;background:#fff;border:0.5px solid var(--border);border-radius:8px">
+  <div style="font-size:13px;font-weight:500;margin-bottom:10px">Run a test now</div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <button onclick="runTest('Drop In Table Tennis - Senior Services','Newton')"
+      style="font-size:12px;padding:6px 14px;border-radius:6px;border:0.5px solid var(--border);
+             background:var(--surface);cursor:pointer">
+      🏓 Table Tennis — Newton SC
+    </button>
+    <button onclick="runTest('Drop In Table Tennis - Senior Services','Guildford')"
+      style="font-size:12px;padding:6px 14px;border-radius:6px;border:0.5px solid var(--border);
+             background:var(--surface);cursor:pointer">
+      🏓 Table Tennis — Guildford
+    </button>
+    <button onclick="runTest('Drop In Badminton - Senior Services','Guildford')"
+      style="font-size:12px;padding:6px 14px;border-radius:6px;border:0.5px solid var(--border);
+             background:var(--surface);cursor:pointer">
+      🏸 Badminton — Guildford
+    </button>
+  </div>
+  <div id="test-status" style="margin-top:8px;font-size:12px;color:var(--muted)"></div>
+</div>
+
 <script>
 const SCHEDULE = [
   {day:"Mon",time:"8:15–9:45am",  act:"Badminton",     loc:"Guildford", runs:"7:15am", key:"mon_bad_815"},
@@ -227,6 +249,17 @@ async function refresh(){
 
 refresh();
 setInterval(refresh, 30_000);
+
+async function runTest(className, location) {
+  const el = document.getElementById("test-status");
+  el.textContent = `⏳ Starting: ${className} @ ${location} — check Recent activity in ~30s...`;
+  await fetch("/api/run", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({class_name: className, location: location})
+  });
+  setTimeout(refresh, 5000);
+}
 </script>
 </body>
 </html>"""
@@ -245,6 +278,17 @@ def status():
         "conflicts": conflicts,
         "logs":      list(logs),
     })
+
+
+@app.route("/api/run", methods=["POST"])
+def run_now():
+    """Manually trigger a registration job immediately."""
+    data       = request.get_json(force=True)
+    class_name = data.get("class_name", TT)
+    location   = data.get("location",   GF)
+    t = threading.Thread(target=run_job, args=[class_name, location], daemon=True)
+    t.start()
+    return jsonify({"started": True, "class": class_name, "location": location})
 
 
 # ─── Schedule all 17 jobs ──────────────────────────────────────────────────────
