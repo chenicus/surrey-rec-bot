@@ -1,326 +1,357 @@
 """
-Surrey Rec Registration Bot — Cloud Version
-Runs headless (no visible browser window), designed for Railway/Linux.
+Surrey Rec Registration Bot — Hybrid approach
+  • Login:     Playwright headless (LoginRadius works fine headless)
+  • Attendee:  requests.get() → parse server-rendered HTML (bypasses JS headless detection)
+  • FillForms: requests.post() → get shoppingCartKey from redirect
+  • Checkout:  Playwright → access cross-origin iframe via CDP frames → click Place My Order
+
+Why hybrid?
+  PerfectMind's attendee page runs client-side JS that detects headless Chrome and
+  *removes* the form inputs from the DOM.  But the server HTML always contains them.
+  requests.get() sees the raw server HTML before any JS runs — 100% reliable.
 """
 
 import asyncio
+import json
 import os
+import re
+import urllib.parse
 from datetime import datetime
+
+import requests as rq
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 load_dotenv()
 
-EMAIL    = os.getenv("SURREY_EMAIL")
-PASSWORD = os.getenv("SURREY_PASSWORD")
+EMAIL      = os.getenv("SURREY_EMAIL")
+PASSWORD   = os.getenv("SURREY_PASSWORD")
+CONTACT_ID = os.getenv("SURREY_CONTACT_ID", "283f188a-f820-428b-a38d-9d5b325291f8")
 
-LOGIN_URL   = "https://cityofsurrey.perfectmind.com/23615/Account/LogIn"
+BASE        = "https://cityofsurrey.perfectmind.com"
 BOOKING_URL = (
-    "https://cityofsurrey.perfectmind.com/23615/Clients/BookMe4BookingPages/Classes"
+    f"{BASE}/23615/Clients/BookMe4BookingPages/Classes"
     "?calendarId=be083bfc-aeee-4c7a-aa26-07eb679e18a6"
     "&widgetId=b4059e75-9755-401f-a7b5-d7c75361420d"
     "&embed=False"
 )
+SESSION_FILE = "/tmp/surrey_session.json"
+
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
 
 
 def log(msg: str):
-    print(f"[{datetime.now().strftime('%H:%M:%S.%f')[:-3]}] {msg}", flush=True)
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-async def _login(page):
-    log("Logging in...")
-    # Navigate to the booking page first
-    await page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=30_000)
-    # Give JS widgets a moment to render (LoginRadius injects dynamically)
-    await asyncio.sleep(3)
-    log(f"Landed on: {page.url}")
+# ── Login via Playwright (headless detection does NOT affect the login page) ──
 
-    # Check if already logged in (no Login button visible)
-    login_btn = await page.query_selector('a:has-text("Login"), button:has-text("Login"), a:has-text("Log In"), button:has-text("Log In"), a:has-text("Sign In")')
-    if not login_btn:
-        log("Already logged in ✓")
-        return
+async def _playwright_login():
+    """Login via Playwright headless and save session cookies to SESSION_FILE."""
+    log("Logging in via Playwright...")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process"],
+        )
+        ctx = await browser.new_context(viewport={"width": 1280, "height": 900}, user_agent=UA)
+        page = await ctx.new_page()
 
-    # Click the Login button to open the login form/modal
-    log("Clicking Login button...")
-    await login_btn.click()
-    # Wait for LoginRadius form to inject (it's JS-rendered)
-    await asyncio.sleep(4)
-    log(f"After login click: {page.url}")
-
-    # Wait for LoginRadius form to render (JS-injected, confirmed ID: #loginradius-login-emailid)
-    try:
-        await page.wait_for_selector("#loginradius-login-emailid", timeout=15_000)
-        log("LoginRadius form ready")
-    except PWTimeout:
-        content = await page.content()
-        log(f"Current URL: {page.url}")
-        log(f"Page snippet: {content[1000:2500]}")
-        raise RuntimeError(f"LoginRadius form did not appear (url={page.url})")
-
-    # Use the native value setter — this is what LoginRadius actually requires.
-    # Playwright's fill()/type() don't always trigger LoginRadius's React event handlers,
-    # but setting value via the native HTMLInputElement prototype setter + dispatching
-    # input/change events works reliably (verified manually).
-    log("Filling credentials via native value setter...")
-    await page.evaluate(
-        """([email, password]) => {
-            function setVal(sel, value) {
-                const el = document.querySelector(sel);
-                if (!el) return false;
-                const setter = Object.getOwnPropertyDescriptor(
-                    window.HTMLInputElement.prototype, 'value').set;
-                setter.call(el, value);
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                return true;
-            }
-            setVal('#loginradius-login-emailid', email);
-            setVal('#loginradius-login-password', password);
-        }""",
-        [EMAIL, PASSWORD],
-    )
-    log(f"Credentials set for {EMAIL}")
-    await asyncio.sleep(1)
-
-    # Click the Sign In button via JS (element may not be "visible" to Playwright
-    # even though it works fine — bypass actionability checks with evaluate)
-    log("Clicking Sign In...")
-    await page.evaluate("document.querySelector('#loginradius-submit-login').click()")
-
-    # After submitting credentials, wait for redirect back to perfectmind.com
-    # (accounts.surrey.ca never reaches networkidle — it has ongoing analytics calls)
-    try:
-        await page.wait_for_url("*perfectmind.com*", timeout=30_000)
-    except PWTimeout:
-        pass
-    await asyncio.sleep(2)
-    log(f"After login URL: {page.url}")
-
-    if "accounts.surrey.ca" in page.url or "auth.aspx" in page.url.lower():
-        raise RuntimeError("Login failed — still on auth page. Check SURREY_EMAIL / SURREY_PASSWORD")
-    log("Logged in ✓")
-
-
-CONTACT_ID = os.getenv("SURREY_CONTACT_ID", "283f188a-f820-428b-a38d-9d5b325291f8")
-
-
-async def _do_registration(page, class_name: str, location: str) -> bool:
-    """
-    Full 3-step registration flow (verified by watching the real site):
-      1. Booking page  → find class card → click input.bm-class-details
-      2. Detail page   → click a.bm-book-button
-      3. Attendee page → check David Chen's checkbox → click Next
-    """
-
-    # ── Step 1: find the class card and click Register ──────────────────────
-    try:
-        await page.wait_for_selector(".bm-class-container", timeout=8_000)
-    except PWTimeout:
-        log("No class cards visible yet.")
-
-    rows = await page.query_selector_all(".bm-class-container")
-    log(f"Scanning {len(rows)} cards for '{class_name}' @ '{location}'...")
-
-    clicked_card = False
-    for row in rows:
-        try:
-            text = (await row.inner_text()).strip()
-        except Exception:
-            continue
-        if class_name.lower() not in text.lower():
-            continue
-        if location.lower() not in text.lower():
-            continue
-
-        log(f"Matched card: {text[:100]!r}")
-        btn = await row.query_selector("input.bm-class-details")
-        if not btn:
-            log("Card matched but no Register button (full?).")
-            continue
-        log("Step 1: clicking card Register button...")
-        await page.evaluate("el => el.click()", btn)
-        clicked_card = True
-        break
-
-    if not clicked_card:
-        return False
-
-    # ── Step 2: detail page — click the Register link ───────────────────────
-    try:
-        await page.wait_for_selector("a.bm-book-button", timeout=10_000)
-    except PWTimeout:
-        log("Detail page Register button not found.")
-        return False
-
-    log(f"Step 2: on detail page ({page.url[:60]}...)")
-    # Check "Already Registered" or "Already Booked" here (success for a re-run)
-    detail_text = (await page.content()).lower()
-    if "already registered" in detail_text or "already booked" in detail_text:
-        log("Already registered ✓")
-        return True
-
-    await page.evaluate("document.querySelector('a.bm-book-button').click()")
-    await asyncio.sleep(3)
-
-    # ── Step 3: Select Attendee page — check David Chen, click Next ──────────
-    try:
-        await page.wait_for_selector("input.member-id", timeout=10_000)
-    except PWTimeout:
-        log("Select Attendee page did not appear.")
-        return False
-
-    log(f"Step 3: on attendee page ({page.url[:60]}...)")
-
-    result = await page.evaluate(f"""
-        () => {{
-            // Find David Chen by ContactId (MemberId field)
-            const memberInputs = [...document.querySelectorAll('input.member-id')];
-            const memberInput = memberInputs.find(el => el.value === '{CONTACT_ID}');
-            if (!memberInput) return 'contact_not_found';
-
-            // Derive the IsParticipating checkbox name from the MemberId field name
-            const checkboxName = memberInput.name.replace('.MemberId', '.IsParticipating');
-            const checkbox = document.querySelector(`input[name="${{checkboxName}}"][type="checkbox"]`);
-            if (!checkbox) return 'checkbox_not_found';
-
-            // Check attendance status — if already booked, count as success
-            const statusName = memberInput.name.replace('.MemberId', '.AttendanceStatus');
-            const statusInput = document.querySelector(`input[name="${{statusName}}"]`);
-            if (statusInput && statusInput.value === 'Booked') return 'already_booked';
-
-            if (checkbox.disabled) return 'checkbox_disabled';
-
-            checkbox.click();
-            return 'checked';
-        }}
-    """)
-    log(f"Attendee selection result: {result}")
-
-    if result in ("already_booked",):
-        log("David Chen already registered ✓")
-        return True
-    if result not in ("checked",):
-        log(f"Could not select David Chen: {result}")
-        return False
-
-    # Click the Next button (becomes enabled after checking the checkbox)
-    await asyncio.sleep(1)
-    next_clicked = await page.evaluate("""
-        () => {
-            const btn = document.querySelector('a.bm-button:not(.disabled)');
-            if (btn) { btn.click(); return true; }
-            return false;
-        }
-    """)
-    if not next_clicked:
-        log("Next button not enabled after selecting attendee.")
-        return False
-
-    log("Clicked Next — waiting for confirmation...")
-    await asyncio.sleep(4)
-
-    # ── Step 4: confirmation / checkout ─────────────────────────────────────
-    final_text = (await page.content()).lower()
-    log(f"Final page URL: {page.url[:80]}")
-    if any(w in final_text for w in ("success", "confirmed", "thank you", "booked", "registered", "receipt", "checkout")):
-        log("Registration confirmed ✓")
-        return True
-
-    # If there's a final Confirm/Submit button (e.g. zero-cost checkout), click it
-    confirm = await page.evaluate("""
-        () => {
-            const sel = [
-                'input[value="Confirm"]', 'input[value="Submit"]',
-                'button:not(.disabled)', 'a.bm-button:not(.disabled)'
-            ];
-            for (const s of sel) {
-                const el = document.querySelector(s);
-                if (el && /confirm|submit|complete|next|pay/i.test(el.textContent + el.value)) {
-                    el.click(); return el.textContent || el.value;
-                }
-            }
-            return null;
-        }
-    """)
-    if confirm:
-        log(f"Clicked final button: {confirm!r}")
+        await page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=30_000)
         await asyncio.sleep(3)
-        return True
 
-    log("Could not confirm registration — unknown final page state.")
-    return False
+        login_btn = await page.query_selector(
+            'a:has-text("Login"), button:has-text("Login"), '
+            'a:has-text("Log In"), button:has-text("Log In")'
+        )
+        if not login_btn:
+            log("Already logged in ✓")
+            await ctx.storage_state(path=SESSION_FILE)
+            await browser.close()
+            return
+
+        await login_btn.click()
+        await asyncio.sleep(4)
+        await page.wait_for_selector("#loginradius-login-emailid", timeout=15_000)
+        await page.evaluate(
+            """([e, p]) => {
+                function sv(sel, v) {
+                    const el = document.querySelector(sel);
+                    const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+                    s.call(el, v);
+                    el.dispatchEvent(new Event('input',  {bubbles:true}));
+                    el.dispatchEvent(new Event('change', {bubbles:true}));
+                }
+                sv('#loginradius-login-emailid', e);
+                sv('#loginradius-login-password', p);
+            }""",
+            [EMAIL, PASSWORD],
+        )
+        await page.evaluate("document.querySelector('#loginradius-submit-login').click()")
+        try:
+            await page.wait_for_url("*perfectmind.com*", timeout=30_000)
+        except PWTimeout:
+            pass
+        await asyncio.sleep(2)
+
+        if "accounts.surrey.ca" in page.url or "auth.aspx" in page.url.lower():
+            raise RuntimeError("Login failed — check SURREY_EMAIL / SURREY_PASSWORD")
+
+        await ctx.storage_state(path=SESSION_FILE)
+        log(f"Session saved ✓  ({page.url[:60]})")
+        await browser.close()
 
 
-SESSION_FILE = "/tmp/surrey_session.json"
+# ── requests.Session loaded from Playwright cookies ───────────────────────────
+
+def _make_requests_session() -> rq.Session:
+    """Load Playwright session.json cookies into a requests.Session."""
+    with open(SESSION_FILE) as f:
+        state = json.load(f)
+    session = rq.Session()
+    session.headers.update({"User-Agent": UA})
+    for c in state.get("cookies", []):
+        session.cookies.set(
+            c["name"], c["value"],
+            domain=c.get("domain", ""), path=c.get("path", "/"),
+        )
+    return session
 
 
-async def register(class_name: str, location: str) -> bool:
+# ── Step 1: GET attendee page (server-rendered HTML) ─────────────────────────
+
+def _get_attendee_html(session: rq.Session, event_id: str,
+                       occurrence_date: str, widget_id: str,
+                       location_id: str) -> tuple[str, str]:
+    url = (
+        f"{BASE}/23615/Clients/BookMe4EventParticipants"
+        f"?eventId={event_id}&occurrenceDate={occurrence_date}"
+        f"&widgetId={widget_id}&locationId={location_id}&waitListMode=False"
+    )
+    resp = session.get(url, allow_redirects=True, timeout=20)
+    log(f"Attendee page → {resp.status_code}  {resp.url[:80]}")
+    if resp.status_code != 200:
+        raise RuntimeError(f"Attendee page returned {resp.status_code}")
+    return resp.text, resp.url
+
+
+# ── Step 2: Parse form + POST to FillForms ────────────────────────────────────
+
+def _build_and_post_fillforms(session: rq.Session, html: str,
+                               attendee_url: str) -> rq.Response:
     """
-    Main entry point. Returns True if registration succeeded.
-    Reuses a saved browser session so login only happens once per process lifetime.
+    Parse the server HTML to extract all FillForms fields, set David as
+    participating, and POST.  Uses a list of tuples (not a dict) to preserve
+    duplicate field names (ASP.NET MVC checkbox pattern: send 'true' then 'false').
     """
-    if not EMAIL or not PASSWORD:
-        raise RuntimeError("SURREY_EMAIL and SURREY_PASSWORD environment variables are not set.")
+    soup = BeautifulSoup(html, "html.parser")
+    forms = soup.find_all("form")
+    if len(forms) < 2:
+        raise RuntimeError(f"Expected ≥2 forms in HTML, got {len(forms)}")
+
+    fill_form = forms[1]   # index 0 = AjaxAntiForgeryForm (1 field), index 1 = FillForms (41 fields)
+    action = fill_form.get("action", "")
+    if not action:
+        raise RuntimeError("FillForms form has no action attribute")
+    if action.startswith("/"):
+        action = BASE + action
+    log(f"FillForms action: {action}")
+
+    david_sent = False
+    data: list[tuple[str, str]] = []
+
+    for inp in fill_form.find_all("input"):
+        name  = inp.get("name", "")
+        typ   = inp.get("type", "text").lower()
+        value = inp.get("value", "")
+
+        if not name or typ == "submit":
+            continue
+
+        if typ == "checkbox":
+            if "FamilyMembers[1]" in name and "IsParticipating" in name:
+                # David Chen → checked: send 'true' first (ASP.NET reads first value)
+                data.append((name, "true"))
+                david_sent = True
+            elif inp.get("checked"):
+                # Other checkboxes that are pre-checked in HTML
+                data.append((name, value or "true"))
+            # Unchecked checkboxes: omit — the paired hidden 'false' input handles it
+        else:
+            data.append((name, value))
+
+    if not david_sent:
+        log("WARNING: David's IsParticipating checkbox not found in parsed HTML")
+
+    log(f"Posting {len(data)} fields to FillForms...")
+    resp = session.post(
+        action, data=data,
+        allow_redirects=True, timeout=30,
+        headers={"Referer": attendee_url},
+    )
+    log(f"FillForms → {resp.status_code}  {resp.url[:100]}")
+    return resp
+
+
+# ── Step 3: Playwright checkout (click Place My Order in cross-origin iframe) ─
+
+async def _playwright_checkout(shopping_cart_key: str) -> bool:
+    user_name_enc = urllib.parse.quote(EMAIL or "", safe="")
+    checkout_url = (
+        f"{BASE}/23615/Menu/SocialSite/MemberCheckout"
+        f"?shoppingCartKey={shopping_cart_key}&userName={user_name_enc}"
+    )
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--single-process",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process"],
         )
-
-        # Load saved session if it exists (avoids re-login on every run)
-        import os as _os
-        storage = SESSION_FILE if _os.path.exists(SESSION_FILE) else None
-        if storage:
-            log(f"Loading saved session from {SESSION_FILE}")
-        ctx  = await browser.new_context(
+        ctx = await browser.new_context(
             viewport={"width": 1280, "height": 900},
-            storage_state=storage,
+            storage_state=SESSION_FILE,
+            user_agent=UA,
         )
         page = await ctx.new_page()
 
-        success = False
-        try:
-            await _login(page)
+        log(f"Checkout → {checkout_url[:80]}")
+        await page.goto(checkout_url, wait_until="domcontentloaded", timeout=30_000)
+        await asyncio.sleep(5)   # wait for cross-origin iframe to load
 
-            # Save session after successful login so next run skips login
-            await ctx.storage_state(path=SESSION_FILE)
-            log("Session saved ✓")
+        frame_urls = [f.url[:60] for f in page.frames]
+        log(f"Frames ({len(frame_urls)}): {frame_urls}")
 
-            # Load the booking page
-            await page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=30_000)
-            await asyncio.sleep(3)
+        # Find the online-store / store-ca frame
+        checkout_frame = None
+        for frame in page.frames:
+            if any(k in frame.url for k in ("store", "checkout", "cart", "payment", "order")):
+                checkout_frame = frame
+                break
+        if not checkout_frame and len(page.frames) > 1:
+            checkout_frame = page.frames[1]
+            log(f"Using fallback frame: {checkout_frame.url[:60]}")
 
-            for attempt in range(1, 4):
-                log(f"Attempt {attempt}/3")
-                success = await _do_registration(page, class_name, location)
-                if success:
-                    log(f"✅ Registered: {class_name} @ {location}")
-                    break
-                if attempt < 3:
-                    log("Retrying — reloading booking page...")
-                    await asyncio.sleep(3)
-                    await page.goto(BOOKING_URL, wait_until="domcontentloaded", timeout=30_000)
-                    await asyncio.sleep(3)
-
-            if not success:
-                log(f"❌ Could not register: {class_name} @ {location}")
-
-        except Exception as e:
-            log(f"ERROR: {e}")
-            # If login failed, delete stale session so next run tries fresh
-            if "Login failed" in str(e) or "LoginRadius form" in str(e):
-                if _os.path.exists(SESSION_FILE):
-                    _os.remove(SESSION_FILE)
-                    log("Deleted stale session file")
-            raise
-        finally:
+        if not checkout_frame:
+            log("No checkout frame found")
             await browser.close()
+            return False
 
-    return success
+        log(f"Checkout frame: {checkout_frame.url[:70]}")
+
+        try:
+            await checkout_frame.wait_for_selector(
+                "button, input[type=submit], a", timeout=10_000
+            )
+        except PWTimeout:
+            frame_text = await checkout_frame.evaluate("() => document.body?.innerText || ''")
+            log(f"No interactive elements in checkout frame. Text: {frame_text[:300]}")
+            await browser.close()
+            return False
+
+        placed = await checkout_frame.evaluate("""
+            () => {
+                const btn = [...document.querySelectorAll('button, input[type=submit], a')]
+                    .find(el =>
+                        /place.*order|complete.*order|confirm|checkout/i.test(
+                            (el.textContent || el.value || '').trim()
+                        )
+                    );
+                if (btn) {
+                    btn.click();
+                    return (btn.textContent || btn.value || '').trim();
+                }
+                return 'NO_MATCH:' + [...document.querySelectorAll(
+                    'button, input[type=submit], a'
+                )].slice(0, 15).map(el =>
+                    (el.textContent || el.value || '').trim().substring(0, 40)
+                ).filter(Boolean).join(' | ');
+            }
+        """)
+        log(f"Checkout click: {placed!r}")
+
+        if placed and not placed.startswith("NO_MATCH"):
+            await asyncio.sleep(4)
+            log(f"Final URL: {page.url[:80]}")
+            await browser.close()
+            return True
+
+        # Fallback: check if main page shows success already
+        main_text = await page.evaluate("() => document.body.innerText")
+        if any(w in main_text.lower() for w in ("success", "thank", "confirmed", "booked", "receipt")):
+            log("Registration confirmed ✓  (success text on main page)")
+            await browser.close()
+            return True
+
+        log(f"Could not click Place My Order. Buttons found: {placed}")
+        await browser.close()
+        return False
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
+
+async def register(event_id: str, occurrence_date: str,
+                   widget_id: str, location_id: str) -> bool:
+    """
+    Register David Chen for a drop-in session.
+    Returns True on success, False on failure.
+    """
+    if not EMAIL or not PASSWORD:
+        raise RuntimeError("SURREY_EMAIL and SURREY_PASSWORD must be set")
+
+    # Ensure we have a valid session
+    if not os.path.exists(SESSION_FILE):
+        await _playwright_login()
+
+    session = _make_requests_session()
+
+    # GET attendee page (raw server HTML — no JS headless detection here)
+    try:
+        html, attendee_url = _get_attendee_html(
+            session, event_id, occurrence_date, widget_id, location_id
+        )
+    except Exception as e:
+        log(f"Attendee page failed: {e} — re-logging in...")
+        if os.path.exists(SESSION_FILE):
+            os.remove(SESSION_FILE)
+        await _playwright_login()
+        session = _make_requests_session()
+        html, attendee_url = _get_attendee_html(
+            session, event_id, occurrence_date, widget_id, location_id
+        )
+
+    # Already registered?
+    if re.search(r"already\s+(registered|booked)", html, re.I):
+        log("Already registered ✓")
+        return True
+
+    # POST FillForms
+    try:
+        fill_resp = _build_and_post_fillforms(session, html, attendee_url)
+    except Exception as e:
+        log(f"FillForms failed: {e}")
+        return False
+
+    if re.search(r"already\s+(registered|booked)", fill_resp.text, re.I):
+        log("Already registered ✓  (post-FillForms)")
+        return True
+
+    # Extract shoppingCartKey from the redirect chain
+    cart_key = re.search(r"shoppingCartKey=([^&\s]+)", fill_resp.url)
+    cart_key = cart_key.group(1) if cart_key else None
+
+    if not cart_key:
+        # No cart key — check if the response itself is a success page
+        if any(w in fill_resp.text.lower() for w in ("success", "thank", "confirmed", "receipt")):
+            log("Registration confirmed ✓  (no cart key, success text)")
+            return True
+        log(f"No shoppingCartKey in redirect: {fill_resp.url[:100]}")
+        return False
+
+    log(f"Cart key: {cart_key}")
+
+    # Complete checkout via Playwright iframe
+    return await _playwright_checkout(cart_key)
